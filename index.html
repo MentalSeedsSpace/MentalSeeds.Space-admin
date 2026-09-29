@@ -127,7 +127,8 @@
   .add-bar{display:flex;justify-content:flex-end;padding:12px 18px;border-top:1px solid var(--line);background:var(--paper);}
 
   /* ---- 學員管理頁：三欄快速操作卡片 ---- */
-  .action-row{display:grid;grid-template-columns:repeat(3,1fr);gap:20px;align-items:stretch;margin-bottom:18px;}
+  .action-row{display:flex;flex-direction:column;gap:20px;}
+  .members-layout{display:grid;grid-template-columns:320px 1fr;gap:20px;align-items:start;margin-bottom:18px;}
   .action-card{background:var(--card);border:1px solid var(--line);border-radius:22px;padding:26px;display:flex;flex-direction:column;}
   .action-card h3{font-size:16px;font-weight:700;margin:0 0 18px;padding-bottom:18px;border-bottom:1px solid var(--line);}
   .action-card .desc{font-size:12.5px;color:var(--muted);margin-bottom:16px;line-height:1.6;}
@@ -162,14 +163,15 @@
   .tag-chip .x{cursor:pointer;font-weight:700;opacity:.7;}
   .tag-chip .x:hover{opacity:1;}
   .tag-manage-list{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;}
-  .tag-manage-item{position:relative;display:inline-block;}
-  .tag-manage-item .tag-remove-x{
-    position:absolute;top:-6px;right:-6px;width:18px;height:18px;border-radius:50%;
-    background:var(--danger);color:#fff;font-size:10px;line-height:1;
+  .tag-manage-item{display:inline-flex;align-items:center;gap:6px;}
+  .tag-manage-item .tag-action-btn{
+    width:22px;height:22px;border-radius:50%;
+    font-size:11px;line-height:1;
     display:flex;align-items:center;justify-content:center;cursor:pointer;
-    opacity:0;pointer-events:none;transition:opacity .15s ease;box-shadow:0 1px 3px rgba(0,0,0,.25);
+    opacity:0;pointer-events:none;transition:opacity .15s ease;border:none;
   }
-  .tag-manage-item:hover .tag-remove-x{opacity:1;pointer-events:auto;}
+  .tag-manage-item .tag-action-btn.delete{background:var(--danger);color:#fff;box-shadow:0 1px 3px rgba(0,0,0,.25);}
+  .tag-manage-item:hover .tag-action-btn{opacity:1;pointer-events:auto;}
   .date-row-full{display:flex;gap:8px;margin-bottom:8px;}
   .date-row-full input{flex:1;min-width:0;}
 
@@ -370,7 +372,7 @@
     .two-col-row{grid-template-columns:1fr;gap:14px;}
     .roster-layout{grid-template-columns:1fr;gap:14px;}
     .classes-calendar-row{grid-template-columns:1fr;gap:14px;}
-    .action-row{grid-template-columns:1fr;}
+    .members-layout{grid-template-columns:1fr;}
     .stat-cards{grid-template-columns:repeat(2,1fr);}
 
     .panel-body.pad0{overflow-x:auto;-webkit-overflow-scrolling:touch;}
@@ -540,8 +542,9 @@ let memberPaymentFilterEnd = '';   // 消費紀錄的日期篩選（結束）
 let editingBatchId = null;   // 目前正在編輯的堂數批次 id
 let memberSearchQuery = '';
 let memberSortBy = 'tag_asc'; // 預設用標籤分類排序，方便同標籤的學員排在一起
-let memberStatsCounts = {};   // line_user_id -> 指定區間內的已預約堂數
-let statsMonths = 2;
+let memberTotalPurchased = {};  // line_user_id -> 累積購買堂數
+let memberTotalBooked = {};     // line_user_id -> 累積預約堂數
+let memberTotalExpired = {};    // line_user_id -> 累積已過期堂數
 /* ---- 標籤配色：可以手動選 10 種顏色其中一種，沒選過的話先用自動配色顯示 ---- */
 const TAG_COLORS = [
   { bg:'#eaf0e6', text:'#3f5a3c' }, // 鼠尾草綠
@@ -580,18 +583,25 @@ function todayISO(offsetDays=0){
   const d = new Date(); d.setDate(d.getDate()+offsetDays);
   return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
 }
-let statsRangeStart = todayISO(0);
-let statsRangeEnd = todayISO(60);
-
-async function loadMemberStats(){
-  const { data: rows, error } = await db.from('bookings')
-    .select('line_user_id')
-    .eq('status', 'active')
-    .gte('class_date_iso', statsRangeStart)
-    .lte('class_date_iso', statsRangeEnd);
-  memberStatsCounts = {};
-  if(!error && rows){
-    rows.forEach(r=>{ memberStatsCounts[r.line_user_id] = (memberStatsCounts[r.line_user_id]||0) + 1; });
+async function loadMemberAggregates(){
+  const [batchRes, bookingRes] = await Promise.all([
+    db.from('credit_batches').select('line_user_id, amount, remaining, expires_at'),
+    db.from('bookings').select('line_user_id').in('status', ['active','completed'])
+  ]);
+  memberTotalPurchased = {};
+  memberTotalExpired = {};
+  const today = todayISO(0);
+  if(batchRes.data){
+    batchRes.data.forEach(b=>{
+      if(b.amount>0) memberTotalPurchased[b.line_user_id] = (memberTotalPurchased[b.line_user_id]||0) + b.amount;
+      if(b.expires_at && b.expires_at < today && b.remaining > 0){
+        memberTotalExpired[b.line_user_id] = (memberTotalExpired[b.line_user_id]||0) + b.remaining;
+      }
+    });
+  }
+  memberTotalBooked = {};
+  if(bookingRes.data){
+    bookingRes.data.forEach(r=>{ memberTotalBooked[r.line_user_id] = (memberTotalBooked[r.line_user_id]||0) + 1; });
   }
 }
 
@@ -1970,6 +1980,33 @@ async function removeAvailableTag(tag){
   showToast('已刪除標籤');
 }
 
+async function saveTagRename(oldTag, newTag){
+  if(!newTag || newTag.trim()==='' || newTag.trim()===oldTag) return;
+  const trimmed = newTag.trim();
+  const tags = data.store.available_tags || [];
+  if(tags.includes(trimmed)){ showToast('這個標籤名稱已經存在了'); return; }
+  const newTags = tags.map(t=>t===oldTag ? trimmed : t);
+  const { error } = await db.from('store_settings').update({ available_tags:newTags }).eq('id', 1);
+  if(error){ showToast('修改失敗'); console.error(error); return; }
+  data.store.available_tags = newTags;
+  const colorMap = data.store.tag_colors || {};
+  if(colorMap[oldTag] !== undefined){
+    colorMap[trimmed] = colorMap[oldTag];
+    delete colorMap[oldTag];
+    await db.from('store_settings').update({ tag_colors: colorMap }).eq('id', 1);
+    data.store.tag_colors = colorMap;
+  }
+  const affectedMembers = data.members.filter(m=>(m.tags||[]).includes(oldTag));
+  await Promise.all(affectedMembers.map(m=>{
+    const updatedTags = (m.tags||[]).map(t=>t===oldTag ? trimmed : t);
+    m.tags = updatedTags;
+    return db.from('members').update({ tags: updatedTags }).eq('line_user_id', m.line_user_id);
+  }));
+  expandedColorTag = trimmed;
+  render();
+  showToast(`標籤已改為「${trimmed}」`);
+}
+
 /* ---- 批次操作共用的選取狀態（學員列表打勾） ---- */
 let selectedMemberIds = new Set();
 
@@ -2062,8 +2099,12 @@ function pageMembers(){
   else if(memberSortBy==='name_desc') list = [...list].sort((a,b)=>(b.display_name||'').localeCompare(a.display_name||''));
   else if(memberSortBy==='credits_asc') list = [...list].sort((a,b)=>a.remaining_credits-b.remaining_credits);
   else if(memberSortBy==='credits_desc') list = [...list].sort((a,b)=>b.remaining_credits-a.remaining_credits);
-  else if(memberSortBy==='recent_asc') list = [...list].sort((a,b)=>(memberStatsCounts[a.line_user_id]||0)-(memberStatsCounts[b.line_user_id]||0));
-  else if(memberSortBy==='recent_desc') list = [...list].sort((a,b)=>(memberStatsCounts[b.line_user_id]||0)-(memberStatsCounts[a.line_user_id]||0));
+  else if(memberSortBy==='purchased_asc') list = [...list].sort((a,b)=>(memberTotalPurchased[a.line_user_id]||0)-(memberTotalPurchased[b.line_user_id]||0));
+  else if(memberSortBy==='purchased_desc') list = [...list].sort((a,b)=>(memberTotalPurchased[b.line_user_id]||0)-(memberTotalPurchased[a.line_user_id]||0));
+  else if(memberSortBy==='booked_asc') list = [...list].sort((a,b)=>(memberTotalBooked[a.line_user_id]||0)-(memberTotalBooked[b.line_user_id]||0));
+  else if(memberSortBy==='booked_desc') list = [...list].sort((a,b)=>(memberTotalBooked[b.line_user_id]||0)-(memberTotalBooked[a.line_user_id]||0));
+  else if(memberSortBy==='expired_asc') list = [...list].sort((a,b)=>(memberTotalExpired[a.line_user_id]||0)-(memberTotalExpired[b.line_user_id]||0));
+  else if(memberSortBy==='expired_desc') list = [...list].sort((a,b)=>(memberTotalExpired[b.line_user_id]||0)-(memberTotalExpired[a.line_user_id]||0));
   else if(memberSortBy==='tag_asc') list = [...list].sort((a,b)=>{
     const ta = (a.tags&&a.tags[0])||''; const tb = (b.tags&&b.tags[0])||'';
     if(!ta && tb) return 1; if(ta && !tb) return -1; return ta.localeCompare(tb);
@@ -2079,7 +2120,9 @@ function pageMembers(){
     const avatar = m.picture_url
       ? `<img src="${m.picture_url}" class="avatar-sm" style="object-fit:cover;">`
       : `<span class="avatar-sm">${(m.display_name||'?')[0]}</span>`;
-    const recentCount = memberStatsCounts[m.line_user_id] || 0;
+    const totalPurchased = memberTotalPurchased[m.line_user_id] || 0;
+    const totalBooked = memberTotalBooked[m.line_user_id] || 0;
+    const totalExpired = memberTotalExpired[m.line_user_id] || 0;
     const isTagExpanded = expandedTagMemberId === m.line_user_id;
     const tags = Array.isArray(m.tags) ? m.tags : [];
     const tagChips = tags.map(t=>`<span class="tag on" style="margin:1px 3px 1px 0;display:inline-block;${tagColorStyle(t)}">${t}</span>`).join('') || '<span style="color:var(--muted);font-size:12px;">＋ 新增標籤</span>';
@@ -2100,20 +2143,14 @@ function pageMembers(){
       <td><input type="checkbox" ${isChecked?'checked':''} onchange="toggleMemberSelect('${m.line_user_id}', this.checked)" style="width:16px;height:16px;"></td>
       <td>${avatar}${m.display_name||'（尚未取得姓名）'}</td>
       <td style="cursor:pointer;" onclick="${isTagExpanded ? '' : `toggleTagEditor('${m.line_user_id}')`}" title="點一下編輯標籤">${tagCellContent}</td>
-      <td><b>${m.remaining_credits}</b> 堂</td>
-      <td>${recentCount} 堂</td>
+      <td style="white-space:nowrap;padding:6px 4px;text-align:center;">${totalPurchased}</td>
+      <td style="white-space:nowrap;padding:6px 4px;text-align:center;">${totalBooked}</td>
+      <td style="white-space:nowrap;padding:6px 4px;text-align:center;">${totalExpired ? `<span style="color:var(--danger);">${totalExpired}</span>` : '0'}</td>
+      <td style="white-space:nowrap;padding:6px 4px;text-align:center;"><b>${m.remaining_credits}</b></td>
       <td>
         <div class="row-actions" style="flex-wrap:wrap;justify-content:flex-end;">
           <button class="btn btn-ghost btn-sm" onclick="runCreditAction(()=>openMemberDetail('${m.line_user_id}'))">詳細資訊</button>
-          <span class="member-row-actions">
-          <input type="number" id="setCredits-${m.line_user_id}" placeholder="輸入數字" style="width:70px;border:1px solid var(--line);border-radius:8px;padding:5px 8px;font-size:12.5px;">
-          <div class="date-placeholder-wrap">
-            <input type="date" id="setCreditsExpiry-${m.line_user_id}" onchange="onSetCreditsExpiryChange(this)" title="增加堂數時的效期（留空＝永久有效）" style="width:128px;border:1px solid var(--line);border-radius:8px;padding:5px 6px;font-size:11.5px;">
-            <span class="date-placeholder-text" onclick="var inp=this.previousElementSibling;if(inp.showPicker)inp.showPicker();else inp.focus()">到期日期設定</span>
-          </div>
-          <button class="btn btn-primary btn-sm" onclick="runCreditAction(()=>setMemberCredits('${m.line_user_id}'))">確認</button>
           <button class="btn btn-danger btn-sm" onclick="deleteMember('${m.line_user_id}')">刪除</button>
-          </span>
         </div>
       </td>
     </tr>`;
@@ -2123,101 +2160,92 @@ function pageMembers(){
     <div class="page-title">學員管理</div>
     <div class="page-sub">學員會在<b>第一次透過 LINE 打開預約頁面後</b>自動出現在這份名單裡，你不需要手動新增。點「詳細資訊」可以看到選課歷史、堂數批次明細。在下方列表打勾可以選取多位學員，套用到「批次加堂數」「批次選課」。</div>
 
-    <div class="action-row">
-      <div class="action-card">
-        <h3>標籤管理</h3>
-        <div class="desc">先建立標籤（例如：期班A、體驗、週四晚班），加標籤、篩選學員時就能直接用下拉選單選。點標籤文字可以選顏色。</div>
-        <div class="tag-add-row">
-          <input type="text" id="newAvailableTagInput" placeholder="輸入新標籤" onkeydown="if(event.key==='Enter') addAvailableTag()">
-          <button class="tag-add-btn" onclick="addAvailableTag()">＋</button>
-        </div>
-        <div class="tag-manage-list">
-          ${availableTags.map(t=>{
-            const isOpen = expandedColorTag === t;
-            return `
-            <div>
-              <div style="display:flex;align-items:center;gap:8px;">
-                <span class="tag-manage-item">
-                  <span class="tag-chip" style="cursor:pointer;${tagColorStyle(t)}" onclick="toggleColorPicker('${t}')">${t}</span>
-                  <span class="tag-remove-x" onclick="removeAvailableTag('${t}')" title="刪除標籤">✕</span>
-                </span>
-              </div>
-              ${isOpen ? `
-              <div style="display:flex;gap:7px;flex-wrap:wrap;margin-top:9px;padding-left:2px;">
-                ${TAG_COLORS.map((c,i)=>`<span onclick="setTagColor('${t}', ${i})" title="選這個顏色" style="width:22px;height:22px;border-radius:50%;background:${c.bg};cursor:pointer;border:2px solid ${getTagColorIndex(t)===i ? c.text : 'transparent'};display:inline-block;"></span>`).join('')}
-              </div>` : ''}
-            </div>`;
-          }).join('') || '<span style="color:var(--muted);font-size:12px;">尚未建立任何標籤</span>'}
-        </div>
-      </div>
-
-      <div class="action-card">
-        <h3>批次加堂數</h3>
-        <div class="desc">套用到已選擇的 <b>${selectedMemberIds.size}</b> 位學員。</div>
-        <div class="action-field"><label>堂數</label><input id="bcAmount" type="number" value="10" min="1"></div>
-        <div class="action-field"><label>效期方式</label>
-          <select id="bcExpiryType" onchange="onBatchCreditExpiryTypeChange(this.value)">
-            <option value="none">不設效期（永久有效）</option>
-            <option value="date">指定到期日</option>
-            <option value="days">幾天後到期</option>
-          </select>
-        </div>
-        <div class="action-field" id="bcDateField" style="display:none;"><label>到期日</label><input id="bcExpiryDate" type="date"></div>
-        <div class="action-field" id="bcDaysField" style="display:none;"><label>幾天後到期</label><input id="bcExpiryDays" type="number" value="30" min="1"></div>
-        <div class="action-field"><label>實收金額（選填，NT$／每人）</label><input id="bcAmountPaid" type="number" min="0" placeholder="每人都收這個金額的話可以填"></div>
-        <button class="action-btn-full primary" onclick="runCreditAction(submitBatchCredits)">＋ 新增這批堂數</button>
-      </div>
-
-      <div class="action-card">
-        <h3>批次選課</h3>
-        <div class="desc">套用到已選擇的 <b>${selectedMemberIds.size}</b> 位學員。</div>
-        <div class="action-field">
-          <label>上課日期（可多選，僅固定課程需要）</label>
-          <div id="bbDatesContainer">
-            <div class="date-row-full">
-              <input type="date" class="bbDateInput">
-              <button type="button" class="btn btn-ghost btn-sm" onclick="removeBbDateRow(this)" style="flex-shrink:0;">✕</button>
-            </div>
+    <div class="members-layout">
+      <div class="action-row">
+        <div class="action-card">
+          <h3>批次加堂數</h3>
+          <div class="desc">套用到已選擇的 <b>${selectedMemberIds.size}</b> 位學員。</div>
+          <div class="action-field"><label>堂數</label><input id="bcAmount" type="number" value="10" min="1"></div>
+          <div class="action-field"><label>效期方式</label>
+            <select id="bcExpiryType" onchange="onBatchCreditExpiryTypeChange(this.value)">
+              <option value="none">不設效期（永久有效）</option>
+              <option value="date">指定到期日</option>
+              <option value="days">幾天後到期</option>
+            </select>
           </div>
-          <button type="button" class="action-btn-secondary-full" onclick="addBbDateRow()" style="margin-top:6px;margin-bottom:0;">＋ 新增一個日期</button>
+          <div class="action-field" id="bcDateField" style="display:none;"><label>到期日</label><input id="bcExpiryDate" type="date"></div>
+          <div class="action-field" id="bcDaysField" style="display:none;"><label>幾天後到期</label><input id="bcExpiryDays" type="number" value="30" min="1"></div>
+          <div class="action-field"><label>實收金額（選填，NT$／每人）</label><input id="bcAmountPaid" type="number" min="0" placeholder="每人都收這個金額的話可以填"></div>
+          <button class="action-btn-full primary" onclick="runCreditAction(submitBatchCredits)">＋ 新增這批堂數</button>
         </div>
-        <div class="action-field"><label>課程</label><select id="bbClass">${getClassOptionsHtml() || '<option value="">尚無課程可選</option>'}</select></div>
-        <button class="action-btn-full primary" onclick="submitBatchBooking()">＋ 新增這些預約</button>
-      </div>
-    </div>
 
-    <div class="panel">
-      <div class="panel-head"><h3>學員列表</h3></div>
-      <div class="panel-body" style="display:flex;flex-wrap:wrap;gap:10px;">
-        <select onchange="onMemberTagFilter(this.value)" style="border:1px solid var(--line);border-radius:8px;padding:8px 12px;font-size:13px;">
-          <option value="">全部標籤</option>
-          ${availableTags.map(t=>`<option value="${t}" ${memberTagFilter===t?'selected':''}>${t}</option>`).join('')}
-        </select>
-        <input type="text" placeholder="搜尋姓名..." value="${memberSearchQuery}" oninput="onMemberSearch(this.value)" style="flex:1;min-width:160px;border:1px solid var(--line);border-radius:8px;padding:8px 12px;font-size:13px;">
-        <button class="btn btn-ghost btn-sm" onclick='toggleSelectAllFiltered(${JSON.stringify(list.map(m=>({line_user_id:m.line_user_id})))})'>全選／取消全選（目前顯示）</button>
+        <div class="action-card">
+          <h3>批次選課</h3>
+          <div class="desc">套用到已選擇的 <b>${selectedMemberIds.size}</b> 位學員。先選課程，再勾選要預約的日期。</div>
+          <div class="action-field"><label>課程</label><select id="bbClass" onchange="onBbClassChange()">${'<option value="">請選擇課程</option>' + (getClassOptionsHtml() || '')}</select></div>
+          <div id="bbDatesContainer"></div>
+          <button class="action-btn-full primary" onclick="submitBatchBooking()">＋ 新增這些預約</button>
+        </div>
+
+        <div class="action-card">
+          <h3>標籤管理</h3>
+          <div class="desc">點標籤可以修改名稱和顏色。</div>
+          <div class="tag-add-row">
+            <input type="text" id="newAvailableTagInput" placeholder="輸入新標籤" onkeydown="if(event.key==='Enter') addAvailableTag()">
+            <button class="tag-add-btn" onclick="addAvailableTag()">＋</button>
+          </div>
+          <div class="tag-manage-list">
+            ${availableTags.map(t=>{
+              const isOpen = expandedColorTag === t;
+              return `
+              <div>
+                <div style="display:flex;align-items:center;gap:8px;">
+                  <span class="tag-manage-item">
+                    <span class="tag-chip" style="cursor:pointer;${tagColorStyle(t)}" onclick="toggleColorPicker('${t}')">${t}</span>
+                    <span class="tag-action-btn delete" onclick="removeAvailableTag('${t}')" title="刪除標籤">✕</span>
+                  </span>
+                </div>
+                ${isOpen ? `
+                <div style="margin-top:9px;padding-left:2px;" onclick="event.stopPropagation()">
+                  <div style="display:flex;align-items:center;gap:6px;margin-bottom:8px;">
+                    <input type="text" id="tagRenameInput-${availableTags.indexOf(t)}" value="${t}" style="border:1px solid var(--line);border-radius:6px;padding:4px 8px;font-size:13px;width:120px;">
+                    <button class="btn btn-primary btn-sm" onclick="saveTagRename('${t}', document.getElementById('tagRenameInput-${availableTags.indexOf(t)}').value)" style="padding:4px 10px;font-size:12px;">儲存</button>
+                  </div>
+                  <div style="display:flex;gap:7px;flex-wrap:wrap;">
+                    ${TAG_COLORS.map((c,i)=>`<span onclick="setTagColor('${t}', ${i})" title="選這個顏色" style="width:22px;height:22px;border-radius:50%;background:${c.bg};cursor:pointer;border:2px solid ${getTagColorIndex(t)===i ? c.text : 'transparent'};display:inline-block;"></span>`).join('')}
+                  </div>
+                </div>` : ''}
+              </div>`;
+            }).join('') || '<span style="color:var(--muted);font-size:12px;">尚未建立任何標籤</span>'}
+          </div>
+        </div>
       </div>
-      <div class="panel-body" style="padding-top:0;padding-bottom:14px;display:flex;flex-wrap:wrap;align-items:center;gap:8px;font-size:12px;color:var(--muted);">
-        <span>「近期預約」統計區間：</span>
-        <input type="number" id="statsMonthsInput" value="${statsMonths}" style="width:46px;border:1px solid var(--line);border-radius:6px;padding:4px 6px;font-size:12px;"> 個月
-        <button class="btn btn-ghost btn-sm" onclick="applyStatsMonths()" style="padding:4px 9px;font-size:11px;">套用</button>
-        <span style="color:var(--line);">｜</span>
-        <input type="date" id="statsStart" value="${statsRangeStart}" style="border:1px solid var(--line);border-radius:6px;padding:4px 6px;font-size:12px;">
-        <span>～</span>
-        <input type="date" id="statsEnd" value="${statsRangeEnd}" style="border:1px solid var(--line);border-radius:6px;padding:4px 6px;font-size:12px;">
-        <button class="btn btn-ghost btn-sm" onclick="applyStatsRange()" style="padding:4px 9px;font-size:11px;">套用區間</button>
+
+      <div class="panel" style="margin-bottom:0;">
+        <div class="panel-head"><h3>學員列表</h3></div>
+        <div class="panel-body" style="display:flex;flex-wrap:wrap;gap:10px;">
+          <select onchange="onMemberTagFilter(this.value)" style="border:1px solid var(--line);border-radius:8px;padding:8px 12px;font-size:13px;">
+            <option value="">全部標籤</option>
+            ${availableTags.map(t=>`<option value="${t}" ${memberTagFilter===t?'selected':''}>${t}</option>`).join('')}
+          </select>
+          <input type="text" placeholder="搜尋姓名..." value="${memberSearchQuery}" oninput="onMemberSearch(this.value)" style="flex:1;min-width:160px;border:1px solid var(--line);border-radius:8px;padding:8px 12px;font-size:13px;">
+          <button class="btn btn-ghost btn-sm" onclick='toggleSelectAllFiltered(${JSON.stringify(list.map(m=>({line_user_id:m.line_user_id})))})'>全選／取消全選（目前顯示）</button>
+        </div>
+        <div class="panel-body pad0">
+          <table><thead><tr>
+            <th style="width:30px;"></th>
+            <th style="cursor:pointer;user-select:none;" onclick="sortColumn('name')">學員 ${sortArrow('name')}</th>
+            <th style="cursor:pointer;user-select:none;" onclick="sortColumn('tag')">標籤 ${sortArrow('tag')}</th>
+            <th style="cursor:pointer;user-select:none;font-size:12px;padding:6px 4px;text-align:center;line-height:1.4;" onclick="sortColumn('purchased')">累積<br>購買 ${sortArrow('purchased')}</th>
+            <th style="cursor:pointer;user-select:none;font-size:12px;padding:6px 4px;text-align:center;line-height:1.4;" onclick="sortColumn('booked')">累積<br>預約 ${sortArrow('booked')}</th>
+            <th style="cursor:pointer;user-select:none;font-size:12px;padding:6px 4px;text-align:center;line-height:1.4;" onclick="sortColumn('expired')">累積<br>過期 ${sortArrow('expired')}</th>
+            <th style="cursor:pointer;user-select:none;font-size:12px;padding:6px 4px;text-align:center;line-height:1.4;" onclick="sortColumn('credits')">剩餘<br>可用 ${sortArrow('credits')}</th>
+            <th></th>
+          </tr></thead>
+          <tbody>${rows || '<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:20px;">找不到符合的學員</td></tr>'}</tbody></table>
+        </div>
+        <div class="panel-body"><div class="desc">已選擇 <b>${selectedMemberIds.size}</b> 位學員（左邊「批次加堂數」「批次選課」都會套用到這些人）</div></div>
       </div>
-      <div class="panel-body pad0">
-        <table><thead><tr>
-          <th></th>
-          <th style="cursor:pointer;user-select:none;" onclick="sortColumn('name')">學員 ${sortArrow('name')}</th>
-          <th style="cursor:pointer;user-select:none;" onclick="sortColumn('tag')">標籤 ${sortArrow('tag')}</th>
-          <th style="cursor:pointer;user-select:none;" onclick="sortColumn('credits')">剩餘堂數 ${sortArrow('credits')}</th>
-          <th style="cursor:pointer;user-select:none;" onclick="sortColumn('recent')">近期預約 ${sortArrow('recent')}</th>
-          <th></th>
-        </tr></thead>
-        <tbody>${rows || '<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:20px;">找不到符合的學員</td></tr>'}</tbody></table>
-      </div>
-      <div class="panel-body"><div class="desc">已選擇 <b>${selectedMemberIds.size}</b> 位學員（上面「批次加堂數」「批次選課」都會套用到這些人）</div></div>
     </div>`;
 }
 
@@ -2250,25 +2278,6 @@ async function clearMemberRegistration(lineUserId){
 
 function onMemberSearch(val){ memberSearchQuery = val; render(); }
 
-async function applyStatsMonths(){
-  const months = Number(document.getElementById('statsMonthsInput').value) || 1;
-  statsMonths = months;
-  statsRangeStart = todayISO(0);
-  statsRangeEnd = todayISO(months*30);
-  await loadMemberStats();
-  render();
-  showToast(`已套用未來 ${months} 個月的統計`);
-}
-async function applyStatsRange(){
-  const start = document.getElementById('statsStart').value;
-  const end = document.getElementById('statsEnd').value;
-  if(!start || !end){ showToast('請選擇開始與結束日期'); return; }
-  if(end < start){ showToast('結束日期不能早於開始日期'); return; }
-  statsRangeStart = start; statsRangeEnd = end;
-  await loadMemberStats();
-  render();
-  showToast('已更新統計區間');
-}
 
 /* ---- 堂數批次系統：每批各自的效期，扣款依「最快到期優先」 ---- */
 async function consumeCreditsFromBatches(lineUserId, count){
@@ -2524,19 +2533,61 @@ function getClassOptionsHtml(){
   return templateOptions + extraOptions;
 }
 
-function addBbDateRow(){
+function onBbClassChange(){
   const container = document.getElementById('bbDatesContainer');
-  const row = document.createElement('div');
-  row.className = 'date-row-full';
-  row.innerHTML = `<input type="date" class="bbDateInput">
-    <button type="button" class="btn btn-ghost btn-sm" onclick="removeBbDateRow(this)" style="flex-shrink:0;">✕</button>`;
-  container.appendChild(row);
+  const selected = document.getElementById('bbClass').value;
+  if(!selected){ container.innerHTML = ''; return; }
+  const [type, id] = selected.split(':');
+  if(type==='e'){
+    const override = dayOverrides.find(o=>o.id===id && o.type==='extra');
+    if(!override){ container.innerHTML = ''; return; }
+    container.innerHTML = `<div style="padding:8px 0;"><label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;"><input type="checkbox" class="bbDateCheck" value="${override.date}" checked style="width:16px;height:16px;"> ${dateKeyToLabel(override.date)} ${override.time}</label></div>`;
+    return;
+  }
+  const tmpl = data.classes.find(c=>c.id===id);
+  if(!tmpl){ container.innerHTML = ''; return; }
+  const weekdays = tmpl.weekdays || [];
+  const dates = [];
+  const today = new Date(); today.setHours(0,0,0,0);
+  const end = new Date(today); end.setDate(end.getDate()+90);
+  const cancelledSet = new Set(dayOverrides.filter(o=>o.type==='cancel' && o.class_template_id===id).map(o=>o.date));
+  for(let d=new Date(today); d<=end; d.setDate(d.getDate()+1)){
+    const wd = ['日','一','二','三','四','五','六'][d.getDay()];
+    if(!weekdays.includes(wd)) continue;
+    const iso = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+    if(cancelledSet.has(iso)) continue;
+    dates.push(iso);
+  }
+  if(dates.length===0){ container.innerHTML = '<div style="padding:8px 0;color:var(--muted);font-size:13px;">未來 90 天內沒有符合的上課日期</div>'; return; }
+  const monthGroups = {};
+  dates.forEach(iso => {
+    const m = iso.slice(0,7);
+    if(!monthGroups[m]) monthGroups[m] = [];
+    monthGroups[m].push(iso);
+  });
+  const monthKeys = Object.keys(monthGroups).sort();
+  const monthBtns = monthKeys.map(m => {
+    const [y,mo] = m.split('-');
+    return `<button type="button" class="btn btn-ghost btn-sm" onclick="toggleBbMonth('${m}')" style="font-size:12px;padding:3px 10px;">${parseInt(mo)}月全選</button>`;
+  }).join(' ');
+  container.innerHTML = `
+    <div style="padding:8px 0 4px;">
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px;font-weight:600;cursor:pointer;margin-bottom:6px;"><input type="checkbox" id="bbSelectAll" onchange="toggleBbSelectAll(this.checked)" checked style="width:16px;height:16px;"> 全選／取消全選</label>
+      <div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:6px;">${monthBtns}</div>
+      <div style="max-height:200px;overflow-y:auto;border:1px solid var(--line);border-radius:8px;padding:6px 10px;">
+        ${dates.map(iso=>`<label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;padding:3px 0;"><input type="checkbox" class="bbDateCheck" value="${iso}" checked style="width:16px;height:16px;"> ${dateKeyToLabel(iso)}</label>`).join('')}
+      </div>
+    </div>`;
 }
-function removeBbDateRow(btn){
-  const container = document.getElementById('bbDatesContainer');
-  const row = btn.closest('.date-row-full');
-  if(container.children.length<=1){ row.querySelector('input').value=''; return; }
-  row.remove();
+function toggleBbSelectAll(checked){
+  document.querySelectorAll('.bbDateCheck').forEach(cb=>{ cb.checked = checked; });
+}
+function toggleBbMonth(month){
+  const cbs = [...document.querySelectorAll('.bbDateCheck')].filter(cb=>cb.value.startsWith(month));
+  const allChecked = cbs.every(cb=>cb.checked);
+  cbs.forEach(cb=>{ cb.checked = !allChecked; });
+  const allCbs = [...document.querySelectorAll('.bbDateCheck')];
+  document.getElementById('bbSelectAll').checked = allCbs.every(cb=>cb.checked);
 }
 
 async function submitBatchBooking(){
@@ -2545,6 +2596,8 @@ async function submitBatchBooking(){
   const selected = document.getElementById('bbClass').value;
   if(!selected){ showToast('請選擇課程'); return; }
   const [type, id] = selected.split(':');
+  const checkedDates = [...document.querySelectorAll('.bbDateCheck:checked')].map(cb=>cb.value);
+  if(checkedDates.length===0){ showToast('請至少勾選一個日期'); return; }
 
   let successCount = 0;
   const skipped = [];
@@ -2552,19 +2605,12 @@ async function submitBatchBooking(){
   if(type==='t'){
     const tmpl = data.classes.find(c=>c.id===id);
     if(!tmpl){ showToast('找不到課程範本'); return; }
-    const dateValues = [...document.querySelectorAll('.bbDateInput')].map(i=>i.value).filter(Boolean);
-    const uniqueDates = [...new Set(dateValues)];
-    if(uniqueDates.length===0){ showToast('請至少選擇一個日期'); return; }
 
-    const capacityEntries = uniqueDates
-      .filter(dateVal => (tmpl.weekdays||[]).includes(weekdayLabelOf(dateVal)))
-      .map(dateVal => ({ classKey:`${isoToDateKey(dateVal)}_${tmpl.id}`, label:`${dateVal} ${tmpl.title}`, cap:tmpl.cap, addCount:memberIds.length }));
+    const capacityEntries = checkedDates.map(dateVal => ({ classKey:`${isoToDateKey(dateVal)}_${tmpl.id}`, label:`${dateVal} ${tmpl.title}`, cap:tmpl.cap, addCount:memberIds.length }));
     if(!(await checkCapacityBeforeBooking(capacityEntries))) return;
 
     for(const lineUserId of memberIds){
-      for(const dateVal of uniqueDates){
-        const wd = weekdayLabelOf(dateVal);
-        if(!(tmpl.weekdays||[]).includes(wd)){ skipped.push(`${memberName(lineUserId)} ${dateVal}`); continue; }
+      for(const dateVal of checkedDates){
         const dateKey = isoToDateKey(dateVal);
         const ok = await insertOneBooking(lineUserId, {
           classKey: `${dateKey}_${tmpl.id}`, classTemplateId: tmpl.id, title: tmpl.title,
@@ -4579,7 +4625,7 @@ async function navigateToPage(page){
   if(page==='announcement'){ pendingAnnouncementImage = undefined; }
   if(page==='about'){ pendingAboutImage = undefined; aboutDirty = false; }
   if(page==='classes'){ await loadDayOverrides(); }
-  if(page==='members'){ await loadMemberStats(); await loadDayOverrides(); }
+  if(page==='members'){ await loadMemberAggregates(); await loadDayOverrides(); }
   if(page==='roster'){ await loadDayOverrides(); await Promise.all([loadRoster(), loadRosterMonthCounts()]); }
   if(page==='teacherlog'){ await loadTeacherLog(teacherLogSelected || (data.teachers[0] && data.teachers[0].name) || ''); }
   if(page==='cashflow'){ await loadCashflowData(); }
